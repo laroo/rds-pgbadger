@@ -7,6 +7,8 @@ report.
 """
 
 import os
+import sys
+import math
 import errno
 import boto3
 from botocore.exceptions import (ClientError,
@@ -105,13 +107,73 @@ def get_all_logs(dbinstance_id, output,
     for response in response_iterator:
         for log in (name for name in response.get("DescribeDBLogFiles")
                     if not date or date in name["LogFileName"]):
+
             filename = "{}/{}".format(output, log["LogFileName"])
             logger.info("Downloading file %s", filename)
+
+            log_file_name = log['LogFileName']
+            log_file_timestamp = log['LastWritten']
+            log_file_size = log['Size']
+            print('{0: <40} {1: <26} {2: <12}   '.format(log_file_name, format_timestamp(log_file_timestamp),
+                                                         convert_size(log_file_size)))
+
+            if log_file_exists(filename) and log_file_size_match(filename, log_file_size):
+                print('skipping')
+                continue
+
             try:
                 os.remove(filename)
             except OSError:
                 pass
             write_log(client, dbinstance_id, filename, log["LogFileName"])
+
+
+def log_file_local_path(log_file_name):
+    return log_file_name
+
+
+def log_file_exists(log_file_name):
+    if os.path.isfile(log_file_local_path(log_file_name)):
+        return True
+    return False
+
+
+def log_file_size_match(log_file_name, size):
+    full_path = log_file_local_path(log_file_name)
+    if not os.path.isfile(full_path):
+        return False
+
+    file_size = os.path.getsize(full_path)
+    diff = int(file_size) - int(size)
+
+    if diff == 0:
+        return True
+
+    diff_pct = abs((100.0/size) * file_size)
+
+    print('size diff: file={} - api={} = {} diff, '.format(file_size, size, diff_pct), end='')
+
+    if diff_pct > 0.1:
+        print(' NOMATCH ')
+        return False
+
+    print(' MATCH ')
+    return True
+
+
+def convert_size(size):
+    if size == 0:
+        return '0B'
+    size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+    i = int(math.floor(math.log(size, 1024)))
+    p = math.pow(1024, i)
+    s = round(size/p, 2)
+    return '%s %s' % (s, size_name[i])
+
+
+def format_timestamp(timestamp):
+    dt = datetime.fromtimestamp(int(timestamp)/1000.0)
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 
 def write_log(client, dbinstance_id, filename, logfilename):
@@ -151,6 +213,9 @@ def write_log(client, dbinstance_id, filename, logfilename):
                     marker = response["Marker"]
                     logfile.write(response["LogFileData"])
 
+                    # print('.', end='')
+                    # sys.stdout.flush()
+
         if ('LogFileData' in response and
                 not response["LogFileData"].rstrip("\n") and
                 not response["AdditionalDataPending"]):
@@ -187,6 +252,9 @@ def main():
                 assume_role=args.assume_role
             )
     except (EndpointConnectionError, ClientError) as e:
+        print('-'*100)
+        print(type(e))
+        print('-' * 100)
         logger.error(e)
         exit(1)
     except NoRegionError:
