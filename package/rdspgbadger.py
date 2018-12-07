@@ -8,6 +8,7 @@ report.
 
 import os
 import sys
+import time
 import math
 import errno
 import boto3
@@ -79,6 +80,20 @@ def define_logger(verbose=False):
 
 def get_all_logs(dbinstance_id, output,
                  date=None, region=None, assume_role=None):
+
+    # try:
+    #     "ERROR :: An error occurred (403) when calling the PutObject operation: Unauthorized"
+    #     # raise ClientError({'Error': {'Code': '403', 'Message': 'Unauthorized'}}, 'PutObject')
+    #
+    #     "ERROR :: An error occurred (Throttling) when calling the DownloadDBLogFilePortion operation: Rate exceeded"
+    #
+    #     "ERROR :: An error occurred (Throttling) when calling the DownloadDBLogFilePortion operation (reached max retries: 4): Rate exceeded"
+    #     raise ClientError({'Error': {'Code': 'Throttling', 'Message': 'Rate exceeded'}}, 'DownloadDBLogFilePortion')
+    # except ClientError as e:
+    #     print(type(e))
+    #     print(e.__dict__)
+    #     print(e.response.get('Error').get('Code'))
+    #     raise e
 
     boto_args = {}
     if region:
@@ -176,6 +191,24 @@ def format_timestamp(timestamp):
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def download_partial_log_file(client, dbinstance_id, logfilename, marker, max_number_of_lines):
+    try:
+        response = client.download_db_log_file_portion(
+            DBInstanceIdentifier=dbinstance_id,
+            LogFileName=logfilename,
+            Marker=marker,
+            NumberOfLines=max_number_of_lines
+        )
+    except ClientError as e:
+        if e.response.get('Error').get('Code') == 'Throttling':
+            print('Received throttling error... retrying after 10 seconds')
+            time.sleep(10)
+            return download_partial_log_file(client, dbinstance_id, logfilename, marker, max_number_of_lines)
+        raise e
+
+    return response
+
+
 def write_log(client, dbinstance_id, filename, logfilename):
     marker = "0"
     max_number_of_lines = 10000
@@ -183,21 +216,32 @@ def write_log(client, dbinstance_id, filename, logfilename):
     truncated_string = " [Your log message was truncated]"
     slice_length = len(truncated_string) + 1
 
-    response = client.download_db_log_file_portion(
-        DBInstanceIdentifier=dbinstance_id,
-        LogFileName=logfilename,
-        Marker=marker,
-        NumberOfLines=max_number_of_lines
-    )
+    data_pending = True
+    cnt = 0
 
-    while True:
-        if not os.path.exists(os.path.dirname(filename)):
-            try:
-                os.makedirs(os.path.dirname(filename))
-            except OSError as exc:  # Guard against race condition
-                if exc.errno != errno.EEXIST:
-                    raise
-        with open(filename, "a") as logfile:
+    if not os.path.exists(os.path.dirname(filename)):
+        try:
+            os.makedirs(os.path.dirname(filename))
+        except OSError as exc:  # Guard against race condition
+            if exc.errno != errno.EEXIST:
+                raise
+
+    with open(filename, "a") as logfile:
+        while data_pending:
+
+            # response = client.download_db_log_file_portion(
+            #     DBInstanceIdentifier=dbinstance_id,
+            #     LogFileName=logfilename,
+            #     Marker=marker,
+            #     NumberOfLines=max_number_of_lines
+            # )
+            response = download_partial_log_file(client, dbinstance_id, logfilename, marker, max_number_of_lines)
+
+            if response['Marker'] == marker:
+                print('Marker is the same... breaking...')
+                break
+            cnt += 1
+
             if 'LogFileData' in response:
                 if truncated_string in response["LogFileData"][-slice_length:]:
                     downloaded_lines = response["LogFileData"].count("\n")
@@ -216,17 +260,17 @@ def write_log(client, dbinstance_id, filename, logfilename):
                     # print('.', end='')
                     # sys.stdout.flush()
 
-        if ('LogFileData' in response and
-                not response["LogFileData"].rstrip("\n") and
-                not response["AdditionalDataPending"]):
-            break
-
-        response = client.download_db_log_file_portion(
-            DBInstanceIdentifier=dbinstance_id,
-            LogFileName=logfilename,
-            Marker=marker,
-            NumberOfLines=max_number_of_lines
-        )
+            if ('LogFileData' in response and
+                    not response["LogFileData"].rstrip("\n") and
+                    not response["AdditionalDataPending"]):
+                break
+            #
+            # response = client.download_db_log_file_portion(
+            #     DBInstanceIdentifier=dbinstance_id,
+            #     LogFileName=logfilename,
+            #     Marker=marker,
+            #     NumberOfLines=max_number_of_lines
+            # )
 
 
 def main():
@@ -254,6 +298,8 @@ def main():
     except (EndpointConnectionError, ClientError) as e:
         print('-'*100)
         print(type(e))
+        print('-' * 100)
+        print(e.__dict__)
         print('-' * 100)
         logger.error(e)
         exit(1)
