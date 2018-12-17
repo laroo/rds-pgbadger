@@ -5,20 +5,24 @@
 Fetch logs from RDS postgres instance and use them with pgbadger to generate a
 report.
 """
-
+from __future__ import print_function
 import os
-import sys
+import argparse
 import time
 import math
+import fnmatch
 import errno
 import boto3
-from botocore.exceptions import (ClientError,
-                                 EndpointConnectionError,
-                                 NoRegionError,
-                                 NoCredentialsError,
-                                 PartialCredentialsError)
-import argparse
-from datetime import datetime
+import json
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    NoRegionError,
+    NoCredentialsError,
+    PartialCredentialsError
+)
+
+from datetime import datetime, timedelta
 try:
     from shutil import which
 except ImportError:
@@ -28,10 +32,16 @@ import subprocess
 
 import logging
 
-__version__ = "1.2.2"
+__version__ = "1.2.2@laroo"
 
 
 def valid_date(s):
+    if s.lower() == 'today':
+        return datetime.today().strftime("%Y-%m-%d")
+    elif s.lower() == 'yesterday':
+        date_delta = datetime.today() - timedelta(days=1)
+        return date_delta.strftime("%Y-%m-%d")
+
     try:
         return datetime.strptime(s, "%Y-%m-%d").strftime("%Y-%m-%d")
     except ValueError:
@@ -42,13 +52,13 @@ def valid_date(s):
 parser = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
 
-parser.add_argument('instance', help="RDS instance identifier")
+parser.add_argument('instance', help="RDS instance identifier (wildcards allowed)")
 parser.add_argument('--version', action='version',
                     version='%(prog)s {version}'.format(version=__version__))
 
 parser.add_argument('-v', '--verbose', help="increase output verbosity",
                     action='store_true')
-parser.add_argument('-d', '--date', help="get logs for given YYYY-MM-DD date",
+parser.add_argument('-d', '--date', help="get logs for given YYYY-MM-DD date (or use relative: 'today' or 'yesterday')",
                     type=valid_date)
 parser.add_argument('--assume-role', help="AWS STS AssumeRole")
 parser.add_argument('-r', '--region', help="AWS region")
@@ -78,23 +88,7 @@ def define_logger(verbose=False):
     logger.addHandler(consoleHandler)
 
 
-def get_all_logs(dbinstance_id, output,
-                 date=None, region=None, assume_role=None):
-
-    # try:
-    #     "ERROR :: An error occurred (403) when calling the PutObject operation: Unauthorized"
-    #     # raise ClientError({'Error': {'Code': '403', 'Message': 'Unauthorized'}}, 'PutObject')
-    #
-    #     "ERROR :: An error occurred (Throttling) when calling the DownloadDBLogFilePortion operation: Rate exceeded"
-    #
-    #     "ERROR :: An error occurred (Throttling) when calling the DownloadDBLogFilePortion operation (reached max retries: 4): Rate exceeded"
-    #     raise ClientError({'Error': {'Code': 'Throttling', 'Message': 'Rate exceeded'}}, 'DownloadDBLogFilePortion')
-    # except ClientError as e:
-    #     print(type(e))
-    #     print(e.__dict__)
-    #     print(e.response.get('Error').get('Code'))
-    #     raise e
-
+def get_rds_client(region=None, assume_role=None):
     boto_args = {}
     if region:
         boto_args['region_name'] = region
@@ -112,35 +106,94 @@ def get_all_logs(dbinstance_id, output,
         boto_args['aws_session_token'] = credentials['SessionToken']
         logger.info('STS Assumed role %s', assume_role)
 
-    client = boto3.client("rds", **boto_args)
-    paginator = client.get_paginator("describe_db_log_files")
+    rds_client = boto3.client("rds", **boto_args)
+    return rds_client
+
+
+def get_db_instances(rds_client, db_instance_pattern):
+
+    db_instances = []
+    for described_db_instance in rds_client.describe_db_instances()['DBInstances']:
+        instance_id = described_db_instance['DBInstanceIdentifier']
+        logger.debug("Checking pattern '{}' against DB instance '{}'".format(db_instance_pattern, instance_id))
+        if fnmatch.fnmatch(instance_id, db_instance_pattern):
+            db_instances.append(instance_id)
+
+    logger.debug("Included DB instances: {}".format(', '.join(db_instances)))
+    return db_instances
+
+
+def get_all_logs(rds_client, db_instance_id, output_dir, date=None):
+
+    # Test ClientErrors:
+    #     "ERROR :: An error occurred (403) when calling the PutObject operation: Unauthorized"
+    #     # raise ClientError({'Error': {'Code': '403', 'Message': 'Unauthorized'}}, 'PutObject')
+    #
+    #     "ERROR :: An error occurred (Throttling) when calling the DownloadDBLogFilePortion operation: Rate exceeded"
+    #     "ERROR :: An error occurred (Throttling) when calling the DownloadDBLogFilePortion operation (reached max retries: 4): Rate exceeded"
+    #     raise ClientError({'Error': {'Code': 'Throttling', 'Message': 'Rate exceeded'}}, 'DownloadDBLogFilePortion')
+
+    paginator = rds_client.get_paginator("describe_db_log_files")
     response_iterator = paginator.paginate(
-        DBInstanceIdentifier=dbinstance_id,
+        DBInstanceIdentifier=db_instance_id,
         FilenameContains="postgresql.log"
     )
 
+    total_log_file_size = 0
     for response in response_iterator:
         for log in (name for name in response.get("DescribeDBLogFiles")
                     if not date or date in name["LogFileName"]):
 
-            filename = "{}/{}".format(output, log["LogFileName"])
-            logger.info("Downloading file %s", filename)
-
             log_file_name = log['LogFileName']
             log_file_timestamp = log['LastWritten']
             log_file_size = log['Size']
-            print('{0: <40} {1: <26} {2: <12}   '.format(log_file_name, format_timestamp(log_file_timestamp),
-                                                         convert_size(log_file_size)))
+            total_log_file_size += log_file_size
+
+            filename = "{}/{}/{}".format(output_dir, db_instance_id, log["LogFileName"])
+            logger.info("Downloading file {} ({} - {})".format(
+                filename, format_timestamp(log_file_timestamp), convert_size(log_file_size)))
 
             if log_file_exists(filename) and log_file_size_match(filename, log_file_size):
-                print('skipping')
+                logger.debug('skipping, log with same size already exists')
                 continue
+
+            if not os.path.exists(os.path.dirname(filename)):
+                try:
+                    os.makedirs(os.path.dirname(filename))
+                except OSError as exc:  # Guard against race condition
+                    if exc.errno != errno.EEXIST:
+                        raise
 
             try:
                 os.remove(filename)
             except OSError:
                 pass
-            write_log(client, dbinstance_id, filename, log["LogFileName"])
+
+            write_log(rds_client, db_instance_id, filename, log_file_name)
+
+            # TODO Should be a CLI parameter to enable these stats
+            local_log_file_stat = os.stat(filename)
+            stats = {
+                'log_file_name': log_file_name,
+
+                'remote_size_bytes': log_file_size,
+                'remote_size_formatted': convert_size(log_file_size),
+                'remote_last_written_timestamp': log_file_timestamp,
+                'remote_last_written_formatted': format_timestamp(log_file_timestamp),
+
+                'local_size_bytes': local_log_file_stat.st_size,
+                'local_size_formatted': convert_size(local_log_file_stat.st_size),
+                'local_last_written_timestamp': local_log_file_stat.st_atime,
+                'local_last_written_formatted': format_timestamp(local_log_file_stat.st_atime),
+
+                'diff_size_bytes': log_file_size - local_log_file_stat.st_size,
+            }
+            stats_file = '{}.stats.json'.format(filename)
+            with open(stats_file, "w") as log_info:
+                log_info.write(json.dumps(stats, indent=4, sort_keys=True))
+                log_info.write("\n")
+
+    logger.debug('Total log file size: {0: <12}'.format(convert_size(total_log_file_size)))
 
 
 def log_file_local_path(log_file_name):
@@ -166,13 +219,11 @@ def log_file_size_match(log_file_name, size):
 
     diff_pct = abs((100.0/size) * file_size)
 
-    print('size diff: file={} - api={} = {} diff, '.format(file_size, size, diff_pct), end='')
+    logger.debug('Log file size difference: file={} - api={} = {} diff, '.format(file_size, size, diff_pct))
 
     if diff_pct > 0.1:
-        print(' NOMATCH ')
         return False
 
-    print(' MATCH ')
     return True
 
 
@@ -187,60 +238,48 @@ def convert_size(size):
 
 
 def format_timestamp(timestamp):
-    dt = datetime.fromtimestamp(int(timestamp)/1000.0)
+    if '.' in str(timestamp):
+        # Float timestamp
+        dt = datetime.fromtimestamp(float(timestamp))
+    else:
+        # Integer, so divide by 1000
+        dt = datetime.fromtimestamp(int(timestamp)/1000.0)
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 
-def download_partial_log_file(client, dbinstance_id, logfilename, marker, max_number_of_lines):
+def download_partial_log_file(client, db_instance_id, logfilename, marker, max_number_of_lines):
     try:
         response = client.download_db_log_file_portion(
-            DBInstanceIdentifier=dbinstance_id,
+            DBInstanceIdentifier=db_instance_id,
             LogFileName=logfilename,
             Marker=marker,
             NumberOfLines=max_number_of_lines
         )
     except ClientError as e:
         if e.response.get('Error').get('Code') == 'Throttling':
-            print('Received throttling error... retrying after 10 seconds')
+            logger.debug('Received throttling error... retrying after 10 seconds')
             time.sleep(10)
-            return download_partial_log_file(client, dbinstance_id, logfilename, marker, max_number_of_lines)
+            return download_partial_log_file(client, db_instance_id, logfilename, marker, max_number_of_lines)
         raise e
 
     return response
 
 
-def write_log(client, dbinstance_id, filename, logfilename):
+def write_log(client, db_instance_id, filename, logfilename):
     marker = "0"
     max_number_of_lines = 10000
     subtract_lines = 10
     truncated_string = " [Your log message was truncated]"
     slice_length = len(truncated_string) + 1
 
-    data_pending = True
-    cnt = 0
-
-    if not os.path.exists(os.path.dirname(filename)):
-        try:
-            os.makedirs(os.path.dirname(filename))
-        except OSError as exc:  # Guard against race condition
-            if exc.errno != errno.EEXIST:
-                raise
-
     with open(filename, "a") as logfile:
-        while data_pending:
+        while True:
 
-            # response = client.download_db_log_file_portion(
-            #     DBInstanceIdentifier=dbinstance_id,
-            #     LogFileName=logfilename,
-            #     Marker=marker,
-            #     NumberOfLines=max_number_of_lines
-            # )
-            response = download_partial_log_file(client, dbinstance_id, logfilename, marker, max_number_of_lines)
+            response = download_partial_log_file(client, db_instance_id, logfilename, marker, max_number_of_lines)
 
-            if response['Marker'] == marker:
-                print('Marker is the same... breaking...')
+            if 'Marker' in response and response['Marker'] == marker:
+                logger.debug('Marker is the same... breaking...')
                 break
-            cnt += 1
 
             if 'LogFileData' in response:
                 if truncated_string in response["LogFileData"][-slice_length:]:
@@ -254,23 +293,15 @@ def write_log(client, dbinstance_id, filename, logfilename):
                                 "NumberOfLines = {0}".format(
                                     max_number_of_lines))
                 else:
+                    # max_number_of_lines = 10000  # No truncated, so reset
                     marker = response["Marker"]
+                    logger.debug("Writing marker '{}' ({} lines)".format(marker, max_number_of_lines))
                     logfile.write(response["LogFileData"])
-
-                    # print('.', end='')
-                    # sys.stdout.flush()
 
             if ('LogFileData' in response and
                     not response["LogFileData"].rstrip("\n") and
                     not response["AdditionalDataPending"]):
                 break
-            #
-            # response = client.download_db_log_file_portion(
-            #     DBInstanceIdentifier=dbinstance_id,
-            #     LogFileName=logfilename,
-            #     Marker=marker,
-            #     NumberOfLines=max_number_of_lines
-            # )
 
 
 def main():
@@ -288,19 +319,18 @@ def main():
     logger.debug("pgbadger found")
 
     try:
-        get_all_logs(
-                args.instance,
+        rds_client = get_rds_client(region=args.region, assume_role=args.assume_role)
+        db_instances = get_db_instances(rds_client, args.instance)
+
+        for db_instance_id in db_instances:
+            logger.info('Downloading logs: {}'.format(db_instance_id))
+            get_all_logs(
+                rds_client,
+                db_instance_id,
                 args.output,
-                date=args.date,
-                region=args.region,
-                assume_role=args.assume_role
+                date=args.date
             )
     except (EndpointConnectionError, ClientError) as e:
-        print('-'*100)
-        print(type(e))
-        print('-' * 100)
-        print(e.__dict__)
-        print('-' * 100)
         logger.error(e)
         exit(1)
     except NoRegionError:
@@ -316,15 +346,22 @@ def main():
     if args.no_process:
         logger.info("File(s) downloaded. Not processing with PG Badger.")
     else:
-        logger.info("Generating PG Badger report.")
-        command = ("{} -p \"%t:%r:%u@%d:[%p]:\" {} -o {}/report.{} "
-                   "{}/error/*.log.* ".format(pgbadger,
-                                              args.pgbadger_args,
-                                              args.output,
-                                              args.format,
-                                              args.output))
-        logger.debug("Command: %s", command)
-        subprocess.call(command, shell=True)
+        for db_instance_id in db_instances:
+
+            logger.info('Generating PG Badger report: {}'.format(db_instance_id))
+
+            # TODO Only allow pgbadger to parse a single date when specified
+            if args.date:
+                "{}/error/postgresql.log.*".format(args.output)
+
+            command = ("{} -p \"%t:%r:%u@%d:[%p]:\" {} -o {}/report.{} "
+                       "{}/error/*.log.* ".format(pgbadger,
+                                                  args.pgbadger_args,
+                                                  "{}/{}".format(args.output, db_instance_id),
+                                                  args.format,
+                                                  args.output))
+            logger.debug("Command: %s", command)
+            subprocess.call(command, shell=True)
         logger.info("Done")
 
 
