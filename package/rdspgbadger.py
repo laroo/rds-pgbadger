@@ -352,14 +352,16 @@ def main():
 
             # TODO Only allow pgbadger to parse a single date when specified
             if args.date:
-                "{}/error/postgresql.log.*".format(args.output)
+                log_file_pattern = "{}/{}/error/postgresql.log.{}*".format(args.output, db_instance_id, args.date)
+            else:
+                log_file_pattern = "{}/{}/error/postgresql.log.*".format(args.output, db_instance_id)
 
-            command = ("{} -p \"%t:%r:%u@%d:[%p]:\" {} -o {}/report.{} "
-                       "{}/error/*.log.* ".format(pgbadger,
-                                                  args.pgbadger_args,
-                                                  "{}/{}".format(args.output, db_instance_id),
-                                                  args.format,
-                                                  args.output))
+            command = ("{} -p \"%t:%r:%u@%d:[%p]:\" {} -o {}/report.{} {} ".format(
+                pgbadger,
+                args.pgbadger_args,
+                "{}/{}".format(args.output, db_instance_id),
+                args.format,
+                log_file_pattern))
             logger.debug("Command: %s", command)
             subprocess.call(command, shell=True)
         logger.info("Done")
