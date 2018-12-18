@@ -7,6 +7,7 @@ report.
 """
 from __future__ import print_function
 import os
+import glob
 import argparse
 import time
 import math
@@ -14,6 +15,7 @@ import fnmatch
 import errno
 import boto3
 import json
+import typing
 from botocore.exceptions import (
     ClientError,
     EndpointConnectionError,
@@ -33,6 +35,13 @@ import subprocess
 import logging
 
 __version__ = "1.2.2@laroo"
+
+
+pgBadgerLastParsed = typing.NamedTuple('pgBadgerLastParsed', [
+    ('datetime', datetime),
+    ('current_pos', int),
+    ('orig', str),
+])
 
 
 def valid_date(s):
@@ -60,6 +69,8 @@ parser.add_argument('-v', '--verbose', help="increase output verbosity",
                     action='store_true')
 parser.add_argument('-d', '--date', help="get logs for given YYYY-MM-DD date (or use relative: 'today' or 'yesterday')",
                     type=valid_date)
+parser.add_argument('-D', '--delete', help="Delete logs already parsed by pgbadger (using pg_badger's LAST_PARSED)",
+                    action='store_true')
 parser.add_argument('--assume-role', help="AWS STS AssumeRole")
 parser.add_argument('-r', '--region', help="AWS region")
 parser.add_argument('-o', '--output', help="Output folder for logs and report",
@@ -164,11 +175,6 @@ def get_all_logs(rds_client, db_instance_id, output_dir, date=None):
                     if exc.errno != errno.EEXIST:
                         raise
 
-            try:
-                os.remove(filename)
-            except OSError:
-                pass
-
             write_log(rds_client, db_instance_id, filename, log_file_name)
 
             # TODO Should be a CLI parameter to enable these stats
@@ -272,6 +278,11 @@ def write_log(client, db_instance_id, filename, logfilename):
     truncated_string = " [Your log message was truncated]"
     slice_length = len(truncated_string) + 1
 
+    try:
+        os.remove(filename)
+    except OSError:
+        pass
+
     with open(filename, "a") as logfile:
         while True:
 
@@ -295,13 +306,88 @@ def write_log(client, db_instance_id, filename, logfilename):
                 else:
                     # max_number_of_lines = 10000  # No truncated, so reset
                     marker = response["Marker"]
-                    logger.debug("Writing marker '{}' ({} lines)".format(marker, max_number_of_lines))
+                    logger.debug("Writing marker '{}' ({} lines) to {}".format(marker, max_number_of_lines, logfilename))
                     logfile.write(response["LogFileData"])
 
             if ('LogFileData' in response and
                     not response["LogFileData"].rstrip("\n") and
                     not response["AdditionalDataPending"]):
                 break
+
+
+def delete_parsed_logs(db_instance_id, output_dir, date=None):
+    logger.info('Checking logs for deletion: {}'.format(db_instance_id))
+
+    last_parsed_file_path = '{}/LAST_PARSED'.format(get_instance_log_dir(db_instance_id=db_instance_id, output_dir=output_dir))
+    last_parsed = read_pgbadger_last_parsed(last_parsed_file_path)
+    if not last_parsed:
+        # No or corrupt LAST_PARSED found, skip...
+        return False
+
+    parsed_date_pattern = last_parsed.datetime.strftime("%Y-%m-%d")
+    log_file_pattern = get_instance_log_file_pattern(db_instance_id=db_instance_id, output_dir=output_dir, date=date)
+
+    # Get log files sorted by name, compare timestamp and skip rest if a match is found
+    skip_following = False
+    for log_file in sorted(glob.glob(log_file_pattern)):
+        if skip_following or parsed_date_pattern in log_file:
+            logger.debug("Skipping {} ".format(log_file))
+            skip_following = True
+        else:
+            try:
+                logger.info("Deleting parsed log file {} ".format(log_file))
+                # os.remove(log_file)
+            except OSError:
+                logger.error("Could not delete parsed log file {}".format(log_file))
+
+
+def read_pgbadger_last_parsed(last_parsed_file_path):
+    """
+    Reads the LAST_PARSED file and returns a namedtuple with the info
+
+    From pgbadger:
+        my ($datetime, $current_pos, $orig, @others) = split(/\t/, $line);
+        # Last parsed line with pgbouncer log starts with this keyword
+        if ($datetime eq 'pgbouncer') {
+            $pgb_saved_last_line{datetime} = $current_pos;
+            $pgb_saved_last_line{current_pos} = $orig;
+            $pgb_saved_last_line{orig} = join("\t", @others);
+        } else {
+            $saved_last_line{datetime} = $datetime;
+            $saved_last_line{current_pos} = $current_pos;
+            $saved_last_line{orig} = $orig;
+        }
+    """
+    if not os.path.isfile(last_parsed_file_path):
+        logger.debug("No LAST_PARSED file found at '{}'".format(last_parsed_file_path))
+        return False
+
+    with open(last_parsed_file_path) as f:
+        log_line = f.readline()
+
+    fields = log_line.split("\t")
+    if len(fields) < 3:
+        logger.debug("Expected LAST_PARSED file to have at least 3 fields, found {}".format(len(fields)))
+        return False
+    elif fields[0] == 'pgbouncer':
+        raise NotImplementedError('pgbouncer is not supported!')
+
+    return pgBadgerLastParsed(
+        datetime=datetime.strptime(fields[0], '%Y-%m-%d %H:%M:%S'),
+        current_pos=int(fields[1]),
+        orig=fields[2],
+    )
+
+
+def get_instance_log_file_pattern(db_instance_id, output_dir, date=None):
+    log_dir = get_instance_log_dir(db_instance_id, output_dir)
+    if date:
+        return "{}/error/postgresql.log.{}*".format(log_dir, date)
+    return "{}/error/postgresql.log.*".format(log_dir)
+
+
+def get_instance_log_dir(db_instance_id, output_dir):
+    return "{}/{}".format(output_dir, db_instance_id)
 
 
 def main():
@@ -325,9 +411,9 @@ def main():
         for db_instance_id in db_instances:
             logger.info('Downloading logs: {}'.format(db_instance_id))
             get_all_logs(
-                rds_client,
-                db_instance_id,
-                args.output,
+                rds_client=rds_client,
+                db_instance_id=db_instance_id,
+                output_dir=args.output,
                 date=args.date
             )
     except (EndpointConnectionError, ClientError) as e:
@@ -350,21 +436,26 @@ def main():
 
             logger.info('Generating PG Badger report: {}'.format(db_instance_id))
 
-            # TODO Only allow pgbadger to parse a single date when specified
-            if args.date:
-                log_file_pattern = "{}/{}/error/postgresql.log.{}*".format(args.output, db_instance_id, args.date)
-            else:
-                log_file_pattern = "{}/{}/error/postgresql.log.*".format(args.output, db_instance_id)
-
             command = ("{} -p \"%t:%r:%u@%d:[%p]:\" {} -o {}/report.{} {} ".format(
                 pgbadger,
                 args.pgbadger_args,
-                "{}/{}".format(args.output, db_instance_id),
+                get_instance_log_dir(db_instance_id=db_instance_id, output_dir=args.output),
                 args.format,
-                log_file_pattern))
+                get_instance_log_file_pattern(db_instance_id=db_instance_id, output_dir=args.output, date=args.date)
+            ))
             logger.debug("Command: %s", command)
             subprocess.call(command, shell=True)
-        logger.info("Done")
+
+    if args.delete:
+        logger.info("Deleting logs that are already parsed by pgbadger")
+        for db_instance_id in db_instances:
+            delete_parsed_logs(
+                db_instance_id=db_instance_id,
+                output_dir=args.output,
+                date=args.date
+            )
+
+    logger.info("Done")
 
 
 if __name__ == '__main__':
